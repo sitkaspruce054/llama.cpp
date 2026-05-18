@@ -2407,7 +2407,154 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
-// ====================== "True" 2-bit (de)-quantization
+// TurboQuant 3-bit (tbq3_0)
+//
+// Algorithm: randomized Hadamard transform (RHT) + 3-bit Lloyd-Max codebook.
+//   Quantize: normalize vector → apply RHT → scale to ~N(0,1) → nearest centroid
+//   Dequantize: centroid lookup → inverse scale → inverse RHT → denormalize
+//
+// The RHT uses a fixed-seed set of sign flips followed by the normalized
+// Fast Walsh-Hadamard Transform (FWHT). FWHT is self-inverse when normalized,
+// so the same function serves both directions.
+
+// 3-bit Lloyd-Max centroids for N(0,1) (symmetric, sorted ascending).
+static const float TBQ3_CODEBOOK[8] = {
+    -2.1520f, -1.3439f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3439f,  2.1520f,
+};
+
+// Fixed sign-flip pattern for the RHT (xorshift32, seed 42).
+// Each entry is +1 or -1; applied element-wise before and after FWHT.
+static const int8_t TBQ3_SIGNS[QK_TBQ3_0] = {
+     1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1, -1,  1,  1, -1,  1,
+    -1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,
+     1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1, -1,  1,  1, -1,
+    -1,  1, -1, -1,  1, -1,  1,  1,  1, -1,  1, -1, -1,  1, -1,  1,
+     1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1,
+    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1,
+     1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1,  1,  1,  1,
+    -1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1,
+};
+
+// Normalized in-place Fast Walsh-Hadamard Transform for n = power-of-2.
+// Self-inverse: applying twice returns the original vector.
+static void tbq3_fwht(float * x, int n) {
+    for (int len = 1; len < n; len <<= 1) {
+        for (int i = 0; i < n; i += 2 * len) {
+            for (int j = 0; j < len; j++) {
+                float a = x[i + j];
+                float b = x[i + j + len];
+                x[i + j]       = a + b;
+                x[i + j + len] = a - b;
+            }
+        }
+    }
+    const float scale = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) {
+        x[i] *= scale;
+    }
+}
+
+static inline int tbq3_nearest(float z) {
+    int idx = 0;
+    float best = fabsf(z - TBQ3_CODEBOOK[0]);
+    for (int k = 1; k < 8; k++) {
+        float d = fabsf(z - TBQ3_CODEBOOK[k]);
+        if (d < best) { best = d; idx = k; }
+    }
+    return idx;
+}
+
+void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ3_0 == 0);
+    const int64_t nb = k / QK_TBQ3_0;
+    const float sqrt_d = sqrtf((float)QK_TBQ3_0);
+
+    float buf[QK_TBQ3_0];
+
+    for (int64_t i = 0; i < nb; i++) {
+        // compute norm
+        float norm = 0.0f;
+        for (int j = 0; j < QK_TBQ3_0; j++) {
+            norm += x[j] * x[j];
+        }
+        norm = sqrtf(norm);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+
+        if (norm == 0.0f) {
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            x += QK_TBQ3_0;
+            continue;
+        }
+
+        // normalize and apply random sign flips
+        const float inv_norm = 1.0f / norm;
+        for (int j = 0; j < QK_TBQ3_0; j++) {
+            buf[j] = x[j] * inv_norm * TBQ3_SIGNS[j];
+        }
+
+        // randomized Hadamard transform
+        tbq3_fwht(buf, QK_TBQ3_0);
+
+        // scale to ~N(0,1) and pack 3-bit indices
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QK_TBQ3_0; j++) {
+            const int idx      = tbq3_nearest(buf[j] * sqrt_d);
+            const int bit_pos  = j * 3;
+            const int byte_idx = bit_pos >> 3;
+            const int bit_idx  = bit_pos & 7;
+            y[i].qs[byte_idx] |= (uint8_t)(idx << bit_idx);
+            if (bit_idx > 5) {
+                y[i].qs[byte_idx + 1] |= (uint8_t)(idx >> (8 - bit_idx));
+            }
+        }
+
+        x += QK_TBQ3_0;
+    }
+}
+
+size_t quantize_tbq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void)imatrix; // TurboQuant is data-oblivious; imatrix unused
+    assert(n_per_row % QK_TBQ3_0 == 0);
+    quantize_row_tbq3_0_ref(src, dst, nrows * n_per_row);
+    return nrows * n_per_row / QK_TBQ3_0 * sizeof(block_tbq3_0);
+}
+
+void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ3_0 == 0);
+    const int64_t nb = k / QK_TBQ3_0;
+    const float inv_sqrt_d = 1.0f / sqrtf((float)QK_TBQ3_0);
+
+    float buf[QK_TBQ3_0];
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+
+        // unpack 3-bit indices → centroid values → scale back from N(0,1)
+        for (int j = 0; j < QK_TBQ3_0; j++) {
+            const int bit_pos  = j * 3;
+            const int byte_idx = bit_pos >> 3;
+            const int bit_idx  = bit_pos & 7;
+            int idx = (x[i].qs[byte_idx] >> bit_idx) & 0x7;
+            if (bit_idx > 5) {
+                idx |= (x[i].qs[byte_idx + 1] << (8 - bit_idx)) & 0x7;
+            }
+            buf[j] = TBQ3_CODEBOOK[idx] * inv_sqrt_d;
+        }
+
+        // inverse RHT (FWHT is self-inverse when normalized)
+        tbq3_fwht(buf, QK_TBQ3_0);
+
+        // undo sign flips and restore original norm
+        for (int j = 0; j < QK_TBQ3_0; j++) {
+            y[j] = buf[j] * TBQ3_SIGNS[j] * norm;
+        }
+
+        y += QK_TBQ3_0;
+    }
+}
+
+// "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);

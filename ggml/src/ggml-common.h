@@ -278,6 +278,20 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 //
+// TurboQuant quantization (KV cache, randomized Hadamard + scalar quantization)
+//
+
+// 3.125 bpw — TurboQuant MSE variant, 3-bit, block size 128
+// Applies a seeded randomized Hadamard transform then quantizes each
+// coordinate with a 3-bit Lloyd-Max codebook tuned for N(0,1).
+#define QK_TBQ3_0 128
+typedef struct {
+    ggml_half d;       // norm of the original (pre-rotation) vector
+    uint8_t   qs[48];  // 128 x 3-bit indices packed into 48 bytes
+} block_tbq3_0;
+static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + 48, "wrong tbq3_0 block size/padding");
+
+//
 // Super-block quantization structures
 //
 
