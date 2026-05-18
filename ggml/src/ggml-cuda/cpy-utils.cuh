@@ -211,6 +211,80 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
+// TurboQuant 3-bit block quantizer: randomized Hadamard transform + 3-bit Lloyd-Max codebook.
+// Mirrors the CPU reference exactly so round-trip is consistent across backends.
+static __device__ void quantize_f32_tbq3_0_block(const float * __restrict__ x, block_tbq3_0 * __restrict__ y) {
+    // Fixed codebook: Lloyd-Max centroids for N(0,1), 3-bit (8 levels)
+    const float codebook[8] = {
+        -2.1520f, -1.3439f, -0.7560f, -0.2451f,
+         0.2451f,  0.7560f,  1.3439f,  2.1520f,
+    };
+    // Fixed sign flips matching TBQ3_SIGNS in ggml-quants.c (xorshift32, seed 42)
+    const int8_t signs[QK_TBQ3_0] = {
+         1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1, -1,  1,  1, -1,  1,
+        -1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,
+         1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1, -1,  1,  1, -1,
+        -1,  1, -1, -1,  1, -1,  1,  1,  1, -1,  1, -1, -1,  1, -1,  1,
+         1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1,
+        -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1,
+         1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1,  1,  1,  1,
+        -1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1,
+    };
+
+    float buf[QK_TBQ3_0];
+
+    // compute norm
+    float norm2 = 0.0f;
+    for (int j = 0; j < QK_TBQ3_0; j++) norm2 += x[j] * x[j];
+    const float norm = sqrtf(norm2);
+    y->d = __float2half(norm);
+
+    if (norm == 0.0f) {
+        for (int j = 0; j < 48; j++) y->qs[j] = 0;
+        return;
+    }
+
+    const float inv_norm = 1.0f / norm;
+    for (int j = 0; j < QK_TBQ3_0; j++) {
+        buf[j] = x[j] * inv_norm * signs[j];
+    }
+
+    // normalized FWHT
+    for (int len = 1; len < QK_TBQ3_0; len <<= 1) {
+        for (int i = 0; i < QK_TBQ3_0; i += 2 * len) {
+            for (int j = 0; j < len; j++) {
+                float a = buf[i + j];
+                float b = buf[i + j + len];
+                buf[i + j]       = a + b;
+                buf[i + j + len] = a - b;
+            }
+        }
+    }
+    const float scale = rsqrtf((float)QK_TBQ3_0);
+    for (int j = 0; j < QK_TBQ3_0; j++) buf[j] *= scale;
+
+    // quantize: find nearest codebook entry and pack 3 bits
+    const float sqrt_d = sqrtf((float)QK_TBQ3_0);
+    for (int j = 0; j < 48; j++) y->qs[j] = 0;
+
+    for (int j = 0; j < QK_TBQ3_0; j++) {
+        const float z = buf[j] * sqrt_d;
+        int idx = 0;
+        float best = fabsf(z - codebook[0]);
+        for (int k = 1; k < 8; k++) {
+            float d = fabsf(z - codebook[k]);
+            if (d < best) { best = d; idx = k; }
+        }
+        const int bit_pos  = j * 3;
+        const int byte_idx = bit_pos >> 3;
+        const int bit_idx  = bit_pos & 7;
+        y->qs[byte_idx] |= (uint8_t)(idx << bit_idx);
+        if (bit_idx > 5) {
+            y->qs[byte_idx + 1] |= (uint8_t)(idx >> (8 - bit_idx));
+        }
+    }
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);
