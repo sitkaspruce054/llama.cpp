@@ -112,6 +112,32 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_tbq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TBQ3_0 == 0);
+    block_tbq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbq3_0_ref(x, y, k);
+}
+
+void ggml_vec_dot_tbq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    assert(n % QK_TBQ3_0 == 0);
+
+    float tmp[QK_TBQ3_0];
+    float sum = 0.0f;
+
+    const block_tbq3_0 * x = vx;
+    const float        * y = vy;
+    const int nb = n / QK_TBQ3_0;
+
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_tbq3_0(x + i, tmp, QK_TBQ3_0);
+        for (int j = 0; j < QK_TBQ3_0; j++) {
+            sum += tmp[j] * y[i * QK_TBQ3_0 + j];
+        }
+    }
+    *s = sum;
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
