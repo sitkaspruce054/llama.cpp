@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "../ggml-quants-tbq3.h"
 
 #include <cstdint>
 
@@ -286,6 +287,85 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     }
 
     return sum;
+}
+
+// TurboQuant 3-bit KQ dot product.
+// Uses a cooperative unnormalized FWHT within the warp to compute
+// dot(K, Q) = (norm/n) * dot(codebook[qs], H*(signs*Q))
+// without materializing the full K vector in registers.
+// Only valid for D == QK_TBQ3_0 (128) with nthreads == WARP_SIZE (32).
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    static_assert(D == QK_TBQ3_0,       "TBQ3_0 fattn requires D == 128");
+    static_assert(nthreads == WARP_SIZE, "TBQ3_0 fattn requires nthreads == WARP_SIZE");
+
+    const block_tbq3_0 * K_blk = (const block_tbq3_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    const int tid = threadIdx.x % nthreads;
+
+    // Reconstruct this thread's 4 Q float values from q8_1.
+    const int8_t * q8  = (const int8_t *) Q_q8;
+    const float qscale = ((const float2 *) Q_ds_v)[0].x;
+
+    // Generate signs[4*tid .. 4*tid+3] via xorshift32(seed=42) fast-forward.
+    uint32_t state = 42;
+    for (int j = 0; j < 4*tid; j++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+    }
+    float w[4];
+    for (int k = 0; k < 4; k++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        w[k] = ((state >> 31) ? 1.0f : -1.0f) * (q8[k] * qscale);
+    }
+
+    // Within-thread FWHT butterfly stages for len=1, len=2 (no cross-thread comm).
+    { float a = w[0], b = w[1]; w[0] = a+b; w[1] = a-b; }
+    { float a = w[2], b = w[3]; w[2] = a+b; w[3] = a-b; }
+    { float a = w[0], b = w[2]; w[0] = a+b; w[2] = a-b; }
+    { float a = w[1], b = w[3]; w[1] = a+b; w[3] = a-b; }
+
+    // Cross-thread FWHT butterfly stages for len=4..64 via warp shuffles.
+    // xor_mask = 1,2,4,8,16 correspond to len=4,8,16,32,64 stages.
+#pragma unroll
+    for (int xor_mask = 1; xor_mask <= (WARP_SIZE/2); xor_mask <<= 1) {
+        const float p0 = __shfl_xor_sync(0xFFFFFFFF, w[0], xor_mask);
+        const float p1 = __shfl_xor_sync(0xFFFFFFFF, w[1], xor_mask);
+        const float p2 = __shfl_xor_sync(0xFFFFFFFF, w[2], xor_mask);
+        const float p3 = __shfl_xor_sync(0xFFFFFFFF, w[3], xor_mask);
+        const bool lower = (tid & xor_mask) == 0;
+        w[0] = lower ? w[0]+p0 : p0-w[0];
+        w[1] = lower ? w[1]+p1 : p1-w[1];
+        w[2] = lower ? w[2]+p2 : p2-w[2];
+        w[3] = lower ? w[3]+p3 : p3-w[3];
+    }
+
+    // Decode K's 4 indices and dot with H*(signs*Q).
+    const float norm  = __half2float(K_blk->d);
+    const float scale = norm / (float)QK_TBQ3_0;
+    const float codebook[8] = TBQ3_CODEBOOK_INIT;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int j       = tid*4 + k;
+        const int bit_pos  = j * 3;
+        const int byte_idx = bit_pos >> 3;
+        const int bit_idx  = bit_pos & 7;
+        int idx = (K_blk->qs[byte_idx] >> bit_idx) & 0x7;
+        if (bit_idx > 5) {
+            idx |= (K_blk->qs[byte_idx + 1] << (8 - bit_idx)) & 0x7;
+        }
+        sum += codebook[idx] * w[k];
+    }
+
+    return sum * scale;
 }
 
 template <typename Tds, int ni>
@@ -577,6 +657,95 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// TurboQuant 3-bit V dequantization.
+// Uses a cooperative unnormalized FWHT within the warp.
+// All 32 threads of a warp must call this simultaneously with ne == 4
+// and i0 == 4 * (threadIdx.x % WARP_SIZE), as guaranteed for D == 128.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq3_0(
+    const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne == 4, "TBQ3_0 V dequantize requires ne == 4");
+
+    const block_tbq3_0 * x = (const block_tbq3_0 *) vx;
+    const int64_t ib = i0 / QK_TBQ3_0;
+    const int      j0 = (int)(i0 % QK_TBQ3_0);
+    const float norm  = __half2float(x[ib].d);
+
+    // Decode codebook values for this thread's 4 elements.
+    const float codebook[8] = TBQ3_CODEBOOK_INIT;
+    float w[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int j        = j0 + k;
+        const int bit_pos  = j * 3;
+        const int byte_idx = bit_pos >> 3;
+        const int bit_idx  = bit_pos & 7;
+        int idx = (x[ib].qs[byte_idx] >> bit_idx) & 0x7;
+        if (bit_idx > 5) {
+            idx |= (x[ib].qs[byte_idx + 1] << (8 - bit_idx)) & 0x7;
+        }
+        w[k] = codebook[idx];
+    }
+
+    // Within-thread FWHT butterfly stages for len=1, len=2.
+    { float a = w[0], b = w[1]; w[0] = a+b; w[1] = a-b; }
+    { float a = w[2], b = w[3]; w[2] = a+b; w[3] = a-b; }
+    { float a = w[0], b = w[2]; w[0] = a+b; w[2] = a-b; }
+    { float a = w[1], b = w[3]; w[1] = a+b; w[3] = a-b; }
+
+    // Cross-thread FWHT butterfly stages for len=4..64 via warp shuffles.
+    const int tid = j0 / 4;
+#pragma unroll
+    for (int xor_mask = 1; xor_mask <= (WARP_SIZE/2); xor_mask <<= 1) {
+        const float p0 = __shfl_xor_sync(0xFFFFFFFF, w[0], xor_mask);
+        const float p1 = __shfl_xor_sync(0xFFFFFFFF, w[1], xor_mask);
+        const float p2 = __shfl_xor_sync(0xFFFFFFFF, w[2], xor_mask);
+        const float p3 = __shfl_xor_sync(0xFFFFFFFF, w[3], xor_mask);
+        const bool lower = (tid & xor_mask) == 0;
+        w[0] = lower ? w[0]+p0 : p0-w[0];
+        w[1] = lower ? w[1]+p1 : p1-w[1];
+        w[2] = lower ? w[2]+p2 : p2-w[2];
+        w[3] = lower ? w[3]+p3 : p3-w[3];
+    }
+
+    // V[j] = (H*codebook[qs])[j] / n * signs[j] * norm.
+    const float inv_n = 1.0f / (float)QK_TBQ3_0;
+
+    // Generate signs[j0..j0+3] via xorshift32(seed=42) fast-forward.
+    uint32_t state = 42;
+    for (int j = 0; j < j0; j++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+    }
+
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int k = 0; k < ne; k++) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            const float sign = (state >> 31) ? 1.0f : -1.0f;
+            ((float *) dst)[k] = w[k] * inv_n * sign * norm;
+        }
+    }
+#ifdef FP16_AVAILABLE
+    else if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int k = 0; k < ne; k++) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            const float sign = (state >> 31) ? 1.0f : -1.0f;
+            ((half *) dst)[k] = __float2half(w[k] * inv_n * sign * norm);
+        }
+    }
+#endif
+    else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -593,6 +762,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
+        return vec_dot_fattn_vec_KQ_tbq3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -615,6 +786,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ3_0) {
+        return dequantize_V_tbq3_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

@@ -2417,24 +2417,10 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
 // Fast Walsh-Hadamard Transform (FWHT). FWHT is self-inverse when normalized,
 // so the same function serves both directions.
 
-// 3-bit Lloyd-Max centroids for N(0,1) (symmetric, sorted ascending).
-static const float TBQ3_CODEBOOK[8] = {
-    -2.1520f, -1.3439f, -0.7560f, -0.2451f,
-     0.2451f,  0.7560f,  1.3439f,  2.1520f,
-};
+#include "ggml-quants-tbq3.h"
 
-// Fixed sign-flip pattern for the RHT (xorshift32, seed 42).
-// Each entry is +1 or -1; applied element-wise before and after FWHT.
-static const int8_t TBQ3_SIGNS[QK_TBQ3_0] = {
-     1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1, -1,  1,  1, -1,  1,
-    -1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,
-     1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1, -1,  1,  1, -1,
-    -1,  1, -1, -1,  1, -1,  1,  1,  1, -1,  1, -1, -1,  1, -1,  1,
-     1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1,
-    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1,
-     1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1,  1,  1,  1,
-    -1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1,
-};
+static const float  TBQ3_CODEBOOK[8]         = TBQ3_CODEBOOK_INIT;
+static const int8_t TBQ3_SIGNS[QK_TBQ3_0]    = TBQ3_SIGNS_INIT;
 
 // Normalized in-place Fast Walsh-Hadamard Transform for n = power-of-2.
 // Self-inverse: applying twice returns the original vector.

@@ -261,6 +261,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-tbq3.cpp)
+    target_include_directories(test-tbq3 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     llama_build_and_test(test-rope.cpp)
 endif()
 

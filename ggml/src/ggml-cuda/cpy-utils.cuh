@@ -2,6 +2,7 @@
 
 #include "ggml-common.h"
 #include "convert.cuh"
+#include "../ggml-quants-tbq3.h"
 
 static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
@@ -214,22 +215,8 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
 // TurboQuant 3-bit block quantizer: randomized Hadamard transform + 3-bit Lloyd-Max codebook.
 // Mirrors the CPU reference exactly so round-trip is consistent across backends.
 static __device__ void quantize_f32_tbq3_0_block(const float * __restrict__ x, block_tbq3_0 * __restrict__ y) {
-    // Fixed codebook: Lloyd-Max centroids for N(0,1), 3-bit (8 levels)
-    const float codebook[8] = {
-        -2.1520f, -1.3439f, -0.7560f, -0.2451f,
-         0.2451f,  0.7560f,  1.3439f,  2.1520f,
-    };
-    // Fixed sign flips matching TBQ3_SIGNS in ggml-quants.c (xorshift32, seed 42)
-    const int8_t signs[QK_TBQ3_0] = {
-         1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1, -1,  1,  1, -1,  1,
-        -1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,
-         1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1, -1,  1,  1, -1,
-        -1,  1, -1, -1,  1, -1,  1,  1,  1, -1,  1, -1, -1,  1, -1,  1,
-         1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1,
-        -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1,
-         1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1,  1,  1,  1,
-        -1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1,
-    };
+    const float  codebook[8]      = TBQ3_CODEBOOK_INIT;
+    const int8_t signs[QK_TBQ3_0] = TBQ3_SIGNS_INIT;
 
     float buf[QK_TBQ3_0];
 
